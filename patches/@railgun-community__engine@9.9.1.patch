@@ -1,0 +1,19 @@
+diff --git a/dist/wallet/abstract-wallet.js b/dist/wallet/abstract-wallet.js
+index f4b451a446fecf13423017f6302b5408e62ef89d..251957a0498126234b8def75e4006eba9e5910a1 100644
+--- a/dist/wallet/abstract-wallet.js
++++ b/dist/wallet/abstract-wallet.js
+@@ -1836,7 +1836,13 @@ class AbstractWallet extends events_1.default {
+                 }
+                 // Create sparse array of tree
+                 const treeHeight = await utxoMerkletree.getTreeLength(treeIndex);
+-                const batchSize = merkletree_types_1.CommitmentProcessingGroupSize.XXLarge;
++                const configuredBatchSize = Number(process.env.HUSH_SCAN_BATCH_SIZE);
++                const batchSize =
++                    Number.isSafeInteger(configuredBatchSize) &&
++                        configuredBatchSize >= 100 &&
++                        configuredBatchSize <= 4000
++                        ? configuredBatchSize
++                        : merkletree_types_1.CommitmentProcessingGroupSize.Large;
+                 const totalLeavesToScan = treeHeight - startScanHeight;
+                 const totalBatches = Math.ceil(totalLeavesToScan / batchSize);
+                 for (let batchIndex = 0; batchIndex < totalBatches; batchIndex += 1) {

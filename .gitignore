@@ -1,0 +1,17 @@
+# 依赖目录：本地安装，禁止提交
+node_modules/
+
+# TypeScript 编译输出
+dist/
+
+# 本地秘密、同步数据库和证明缓存，绝不提交
+.env
+.env.*
+!.env.example
+data/
+
+# 系统与工具产物
+.DS_Store
+*.log
+
+coverage/

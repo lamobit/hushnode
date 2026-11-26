@@ -1,0 +1,26 @@
+diff --git a/lib/files.js b/lib/files.js
+index 3ffad762a78933e44d962ed3725f47acbfe303ff..089b1d54dd0637c4eac4e6844ba5280eb54069a0 100644
+--- a/lib/files.js
++++ b/lib/files.js
+@@ -98,7 +98,7 @@ var downloadAndCheck = function downloadAndCheck(url) {
+ 
+ var extract = function extract(fromPath) {
+   return function (toPath) {
+-    return tar.x(fromPath, toPath).then(function () {
++    return tar.x({ file: fromPath, cwd: toPath }).then(function () {
+       return toPath;
+     });
+   };
+diff --git a/src/files.js b/src/files.js
+index 01e5d6f2a5e2ff78754fbbfa48dde8683984f6ce..0f35163596f57a267c34b42c4f03f567a0d71613 100644
+--- a/src/files.js
++++ b/src/files.js
+@@ -65,7 +65,7 @@ const downloadAndCheck = url => path => fileHash =>
+ // String -> String ~> Promise String
+ //   TODO: work for zip and other types
+ const extract = fromPath => toPath =>
+-  tar.x(fromPath, toPath)
++  tar.x({ file: fromPath, cwd: toPath })
+     .then(() => toPath);
+ 
+ // String ~> Promise String
