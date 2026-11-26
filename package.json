@@ -2,6 +2,7 @@
   "name": "hush-node",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "description": "Public read-only RAILGUN light index API",
   "type": "module",
   "packageManager": "pnpm@12.21.0",

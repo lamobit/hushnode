@@ -74,3 +74,7 @@ Public RPCs are usually suitable only for incremental sync. Configure a
 reliable private or paid RPC when QuickSync is unavailable or when building the
 tree from scratch. Public deployments must terminate TLS, rate limit, and keep
 access logs at an outer proxy.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
