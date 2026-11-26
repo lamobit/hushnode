@@ -11,7 +11,7 @@ Please do not open a public issue for security problems.
 
 Use GitHub's private vulnerability reporting: open the repository's
 **Security** tab and choose **Report a vulnerability**. If that is unavailable,
-email `dev@uin.app`.
+email `support@uin.app`.
 
 Include the affected endpoint or component, the version or commit you tested,
 reproduction steps, and the impact you believe is possible. We will acknowledge
