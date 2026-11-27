@@ -14,6 +14,16 @@ import type { EffectiveRemoteConfig } from "./remote-config.js";
 
 const log = createLogger("broadcasters");
 
+const MAX_PENDING_OPERATIONS = 128;
+const MAX_QUEUE_WAIT_MS = 30_000;
+
+export class BroadcasterTransportError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BroadcasterTransportError";
+  }
+}
+
 const sameChain = (left: Chain | undefined, right: Chain): boolean =>
   Boolean(
     left && left.type === right.type && left.id === right.id,
@@ -41,6 +51,7 @@ export class BroadcasterNetwork {
   private started = false;
   private connected = false;
   private queue: Promise<unknown> = Promise.resolve();
+  private pendingOperations = 0;
 
   constructor(private readonly getConfig: () => EffectiveRemoteConfig) {}
 
@@ -119,15 +130,18 @@ export class BroadcasterNetwork {
   }
 
   async stop(): Promise<void> {
-    await this.exclusive(async () => {
-      if (!this.started) return;
-      await WakuBroadcasterClient.stop().catch((error: unknown) => {
-        log.warn("broadcaster stop failed", error);
-      });
-      this.started = false;
-      this.connected = false;
-      this.activeChain = undefined;
-    });
+    await this.exclusive(
+      async () => {
+        if (!this.started) return;
+        await WakuBroadcasterClient.stop().catch((error: unknown) => {
+          log.warn("broadcaster stop failed", error);
+        });
+        this.started = false;
+        this.connected = false;
+        this.activeChain = undefined;
+      },
+      true,
+    );
   }
 
   private configure(): EffectiveRemoteConfig {
@@ -141,12 +155,61 @@ export class BroadcasterNetwork {
     return config;
   }
 
-  private exclusive<T>(operation: () => Promise<T>): Promise<T> {
-    const next = this.queue.then(operation, operation);
+  private exclusive<T>(
+    operation: () => Promise<T>,
+    force = false,
+  ): Promise<T> {
+    if (!force && this.pendingOperations >= MAX_PENDING_OPERATIONS) {
+      return Promise.reject(
+        new BroadcasterTransportError(
+          "Broadcaster relay is busy; try again later.",
+        ),
+      );
+    }
+    this.pendingOperations += 1;
+    const queuedAt = Date.now();
+    let expired = false;
+    const run = async (): Promise<T> => {
+      try {
+        if (
+          !force &&
+          (expired || Date.now() - queuedAt > MAX_QUEUE_WAIT_MS)
+        ) {
+          throw new BroadcasterTransportError(
+            "Broadcaster relay request expired while queued.",
+          );
+        }
+        return await operation();
+      } finally {
+        this.pendingOperations = Math.max(0, this.pendingOperations - 1);
+      }
+    };
+    const next = this.queue.then(run, run);
     this.queue = next.then(
       () => undefined,
       () => undefined,
     );
-    return next;
+    if (force) return next;
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        expired = true;
+        reject(
+          new BroadcasterTransportError(
+            "Broadcaster relay is busy; try again later.",
+          ),
+        );
+      }, MAX_QUEUE_WAIT_MS);
+      timer.unref();
+      next.then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+    });
   }
 }

@@ -1,5 +1,6 @@
 import type { RequestHandler, Router } from "express";
-import { throwIfAborted } from "../../abort.js";
+import { raceWithAbort, throwIfAborted } from "../../abort.js";
+import { withTimeout } from "../../async-lifecycle.js";
 import { createLogger } from "../../logger.js";
 import { classifyRelayError } from "../../relay-error.js";
 import type { LightRouteContext } from "../context.js";
@@ -15,6 +16,7 @@ import {
 } from "../protocol.js";
 
 const log = createLogger("light-api");
+const RELAY_TIMEOUT_MS = 30_000;
 
 const requireRelayEnabled = (enabled: boolean): RequestHandler => (
   _request,
@@ -56,9 +58,14 @@ export const registerRelayRoute = (
       );
       throwIfAborted(signal);
       try {
-        const hash = await source
-          .provider(network)
-          .sendRawTransaction(rawTransaction);
+        const hash = await withTimeout(
+          raceWithAbort(
+            source.provider(network).sendRawTransaction(rawTransaction),
+            signal,
+          ),
+          RELAY_TIMEOUT_MS,
+          "Transaction relay timed out.",
+        );
         if (typeof hash !== "string" || !RELAY_HASH_PATTERN.test(hash)) {
           throw new Error("Relay returned an invalid transaction hash.");
         }

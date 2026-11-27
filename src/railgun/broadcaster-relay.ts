@@ -5,6 +5,7 @@ import {
   TXIDVersion,
   getEVMGasTypeForTransaction,
   type NetworkName,
+  type PreTransactionPOI,
   type PreTransactionPOIsPerTxidLeafPerList,
   type TransactionGasDetails,
 } from "@railgun-community/shared-models";
@@ -12,13 +13,24 @@ import { calculateBroadcasterFeeERC20Amount } from "@railgun-community/wallet";
 import type { LightRpcProvider } from "../light-api/protocol.js";
 import { createLogger } from "../logger.js";
 import { chainFor, networkFor } from "../networks.js";
-import type { BroadcasterNetwork } from "./broadcasters.js";
+import {
+  BroadcasterTransportError,
+  type BroadcasterNetwork,
+} from "./broadcasters.js";
 
 const log = createLogger("broadcaster-relay");
 
 const QUOTE_TTL_MS = 90_000;
 const MAX_FEE_BPS = 1_000n;
 const MAX_QUOTES = 512;
+const MAX_DECIMAL_UINT256_DIGITS = 78;
+const MAX_UINT256 = (1n << 256n) - 1n;
+const MAX_POI_LISTS = 8;
+const MAX_POI_LEAVES = 64;
+const MAX_POI_MERKLE_ROOTS = 8;
+const MAX_POI_BLINDED_COMMITMENTS = 32;
+const MAX_POI_STRING_LENGTH = 256;
+const MAX_POI_TOTAL_BYTES = 512 * 1024;
 const GAS_LIMIT_TRANSFER = 600_000n;
 const GAS_LIMIT_UNSHIELD = 800_000n;
 const ONE_GWEI = 1_000_000_000n;
@@ -118,12 +130,20 @@ export const parseAmount = (value: unknown): bigint => {
       "amount must be a decimal string.",
     );
   }
-  const amount = BigInt(value);
-  if (amount <= 0n) {
+  const digits = value.replace(/^0+/, "") || "0";
+  if (digits.length > MAX_DECIMAL_UINT256_DIGITS) {
     throw new BroadcasterRelayError(
       400,
       "INVALID_AMOUNT",
-      "amount must be greater than zero.",
+      "amount must be an unsigned 256-bit decimal string.",
+    );
+  }
+  const amount = BigInt(digits);
+  if (amount <= 0n || amount > MAX_UINT256) {
+    throw new BroadcasterRelayError(
+      400,
+      "INVALID_AMOUNT",
+      "amount must be a positive unsigned 256-bit decimal string.",
     );
   }
   return amount;
@@ -179,6 +199,148 @@ export const parseQuoteId = (value: unknown): string => {
   return id;
 };
 
+const invalidPoi = (message: string): BroadcasterRelayError =>
+  new BroadcasterRelayError(
+    400,
+    "INVALID_PRE_TRANSACTION_POIS",
+    message,
+  );
+
+const isPlainRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+const isHexKey = (value: string): boolean =>
+  /^[0-9a-f]{64}$/i.test(value.replace(/^0x/i, ""));
+
+const poiString = (
+  value: unknown,
+  name: string,
+  allowEmpty = false,
+): string => {
+  if (
+    typeof value !== "string" ||
+    (!allowEmpty && value.length === 0) ||
+    value.length > MAX_POI_STRING_LENGTH
+  ) {
+    throw invalidPoi(`${name} must be a bounded string.`);
+  }
+  return value;
+};
+
+const poiStringArray = (
+  value: unknown,
+  maxItems: number,
+  name: string,
+): string[] => {
+  if (!Array.isArray(value) || value.length > maxItems) {
+    throw invalidPoi(`${name} must contain at most ${maxItems} entries.`);
+  }
+  return value.map((entry) => poiString(entry, name));
+};
+
+const poiProofPair = (
+  value: unknown,
+  name: string,
+): [string, string] => {
+  if (!Array.isArray(value) || value.length !== 2) {
+    throw invalidPoi(`${name} must contain two coordinates.`);
+  }
+  return [poiString(value[0], name), poiString(value[1], name)];
+};
+
+const poiProof = (value: unknown): PreTransactionPOI["snarkProof"] => {
+  if (!isPlainRecord(value)) {
+    throw invalidPoi("snarkProof must be an object.");
+  }
+  const piB = value.pi_b;
+  if (!Array.isArray(piB) || piB.length !== 2) {
+    throw invalidPoi("snarkProof.pi_b must contain two rows.");
+  }
+  return {
+    pi_a: poiProofPair(value.pi_a, "snarkProof.pi_a"),
+    pi_b: [
+      poiProofPair(piB[0], "snarkProof.pi_b"),
+      poiProofPair(piB[1], "snarkProof.pi_b"),
+    ],
+    pi_c: poiProofPair(value.pi_c, "snarkProof.pi_c"),
+  };
+};
+
+const parsePoi = (value: unknown): PreTransactionPOI => {
+  if (!isPlainRecord(value)) {
+    throw invalidPoi("Each pre-transaction POI must be an object.");
+  }
+  return {
+    snarkProof: poiProof(value.snarkProof),
+    txidMerkleroot: poiString(value.txidMerkleroot, "txidMerkleroot"),
+    poiMerkleroots: poiStringArray(
+      value.poiMerkleroots,
+      MAX_POI_MERKLE_ROOTS,
+      "poiMerkleroots",
+    ),
+    blindedCommitmentsOut: poiStringArray(
+      value.blindedCommitmentsOut,
+      MAX_POI_BLINDED_COMMITMENTS,
+      "blindedCommitmentsOut",
+    ),
+    railgunTxidIfHasUnshield: poiString(
+      value.railgunTxidIfHasUnshield,
+      "railgunTxidIfHasUnshield",
+      true,
+    ),
+  };
+};
+
+export const parsePreTransactionPOIs = (
+  value: unknown,
+): PreTransactionPOIsPerTxidLeafPerList => {
+  if (!isPlainRecord(value)) {
+    throw invalidPoi("preTransactionPOIs must be an object.");
+  }
+  const lists = Object.entries(value);
+  if (lists.length > MAX_POI_LISTS) {
+    throw invalidPoi(
+      `preTransactionPOIs must contain at most ${MAX_POI_LISTS} lists.`,
+    );
+  }
+  let leaves = 0;
+  const parsed: Record<string, Record<string, PreTransactionPOI>> = {};
+  for (const [listKey, leafMap] of lists) {
+    if (!isHexKey(listKey)) {
+      throw invalidPoi(
+        "preTransactionPOIs list keys must be 32-byte hex strings.",
+      );
+    }
+    if (!isPlainRecord(leafMap)) {
+      throw invalidPoi("Each preTransactionPOIs list must be an object.");
+    }
+    const entries = Object.entries(leafMap);
+    leaves += entries.length;
+    if (leaves > MAX_POI_LEAVES) {
+      throw invalidPoi(
+        `preTransactionPOIs must contain at most ${MAX_POI_LEAVES} leaves.`,
+      );
+    }
+    const parsedLeaves: Record<string, PreTransactionPOI> = {};
+    for (const [leafKey, poi] of entries) {
+      if (!isHexKey(leafKey)) {
+        throw invalidPoi(
+          "preTransactionPOIs leaf keys must be 32-byte hex strings.",
+        );
+      }
+      parsedLeaves[leafKey] = parsePoi(poi);
+    }
+    parsed[listKey] = parsedLeaves;
+  }
+  if (
+    Buffer.byteLength(JSON.stringify(parsed), "utf8") >
+    MAX_POI_TOTAL_BYTES
+  ) {
+    throw invalidPoi("preTransactionPOIs is too large.");
+  }
+  return parsed;
+};
+
 export class BroadcasterRelay {
   private readonly quotes = new Map<string, StoredQuote>();
 
@@ -187,7 +349,11 @@ export class BroadcasterRelay {
   async quote(input: BroadcasterQuoteInput): Promise<BroadcasterQuote> {
     const chain = chainFor(networkFor(input.network));
     const tokenAddress = tokenAddressFromHash(input.tokenHash);
-    await this.deps.broadcasters.ensureChain(chain);
+    try {
+      await this.deps.broadcasters.ensureChain(chain);
+    } catch (error) {
+      throw this.unavailable(error, "chain setup");
+    }
     const broadcaster = this.deps.broadcasters.bestForToken(
       chain,
       tokenAddress,
@@ -292,7 +458,11 @@ export class BroadcasterRelay {
     }
 
     const chain = chainFor(networkFor(stored.network));
-    await this.deps.broadcasters.ensureChain(chain);
+    try {
+      await this.deps.broadcasters.ensureChain(chain);
+    } catch (error) {
+      throw this.unavailable(error, "chain setup");
+    }
     const current = this.deps.broadcasters.bestForToken(
       chain,
       stored.tokenAddress,
@@ -332,13 +502,22 @@ export class BroadcasterRelay {
     } catch (error) {
       stored.usedAt = undefined;
       if (error instanceof BroadcasterRelayError) throw error;
+      if (error instanceof BroadcasterTransportError) {
+        log.warn(
+          `broadcast transport failed for ${stored.id.slice(0, 8)}`,
+          error,
+        );
+        throw new BroadcasterRelayError(
+          503,
+          "BROADCASTER_UNAVAILABLE",
+          "The broadcaster network is temporarily unavailable.",
+        );
+      }
       log.error(`broadcast failed for ${stored.id.slice(0, 8)}`, error);
       throw new BroadcasterRelayError(
         502,
         "BROADCASTER_FAILED",
-        error instanceof Error
-          ? error.message
-          : "The broadcaster rejected the transaction.",
+        "The broadcaster rejected the transaction.",
       );
     }
   }
@@ -357,6 +536,19 @@ export class BroadcasterRelay {
       if (oldest === undefined) break;
       this.quotes.delete(oldest);
     }
+  }
+
+  private unavailable(
+    error: unknown,
+    operation: string,
+  ): BroadcasterRelayError {
+    if (error instanceof BroadcasterRelayError) return error;
+    log.warn(`broadcaster ${operation} failed`, error);
+    return new BroadcasterRelayError(
+      503,
+      "BROADCASTER_UNAVAILABLE",
+      "The broadcaster network is temporarily unavailable.",
+    );
   }
 }
 

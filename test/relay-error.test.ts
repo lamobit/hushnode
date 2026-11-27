@@ -45,3 +45,15 @@ test("relay classification keeps unknown failures unavailable and sanitized", ()
   assert.equal(failure.code, "RELAY_UNAVAILABLE");
   assert.doesNotMatch(failure.message, /secret|https:/);
 });
+
+test("relay classification bounds deep and cyclic error graphs", () => {
+  let deep: Record<string, unknown> = { message: "nonce too low" };
+  for (let index = 0; index < 12; index += 1) {
+    deep = { cause: deep };
+  }
+  assert.equal(classifyRelayError(deep).code, "RELAY_UNAVAILABLE");
+
+  const cyclic: Record<string, unknown> = {};
+  cyclic.cause = cyclic;
+  assert.equal(classifyRelayError(cyclic).code, "RELAY_UNAVAILABLE");
+});

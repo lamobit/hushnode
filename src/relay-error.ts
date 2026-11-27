@@ -14,6 +14,7 @@ export type RelayFailure = {
 
 const MAX_HINT_NODES = 32;
 const MAX_HINT_DEPTH = 5;
+const MAX_HINT_QUEUE = 256;
 const HINT_KEYS = [
   "code",
   "reason",
@@ -33,8 +34,9 @@ const collectErrorHints = (error: unknown): string => {
   const queue: Array<{ value: unknown; depth: number }> = [
     { value: error, depth: 0 },
   ];
-  while (queue.length > 0 && hints.length < MAX_HINT_NODES) {
-    const current = queue.shift()!;
+  let cursor = 0;
+  while (cursor < queue.length && hints.length < MAX_HINT_NODES) {
+    const current = queue[cursor++]!;
     if (
       current.depth > MAX_HINT_DEPTH ||
       current.value === null ||
@@ -56,7 +58,7 @@ const collectErrorHints = (error: unknown): string => {
       } catch {
         continue;
       }
-      if (nested !== undefined) {
+      if (nested !== undefined && queue.length < MAX_HINT_QUEUE) {
         queue.push({ value: nested, depth: current.depth + 1 });
       }
     }

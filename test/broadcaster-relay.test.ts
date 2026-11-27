@@ -9,6 +9,7 @@ import {
   parseAmount,
   parseCalldata,
   parseNullifiers,
+  parsePreTransactionPOIs,
   parseQuoteId,
   parseTokenHash,
   tokenAddressFromHash,
@@ -86,6 +87,61 @@ test("recovers the token address from a RAILGUN token hash", () => {
   );
   assert.throws(
     () => tokenAddressFromHash("11".repeat(32)),
+    BroadcasterRelayError,
+  );
+});
+
+test("bounds broadcaster amounts to uint256", () => {
+  assert.equal(parseAmount(`${"0".repeat(100)}1`), 1n);
+  const max = (1n << 256n) - 1n;
+  assert.equal(parseAmount(max.toString(10)), max);
+  assert.throws(
+    () => parseAmount((1n << 256n).toString(10)),
+    BroadcasterRelayError,
+  );
+  assert.throws(() => parseAmount("9".repeat(79)), BroadcasterRelayError);
+});
+
+test("validates pre-transaction POI payloads", () => {
+  const listKey = "aa".repeat(32);
+  const leafKey = "bb".repeat(32);
+  const poi = {
+    snarkProof: {
+      pi_a: ["1", "2"],
+      pi_b: [
+        ["3", "4"],
+        ["5", "6"],
+      ],
+      pi_c: ["7", "8"],
+    },
+    txidMerkleroot: "11".repeat(32),
+    poiMerkleroots: ["22".repeat(32)],
+    blindedCommitmentsOut: ["33".repeat(32)],
+    railgunTxidIfHasUnshield: "",
+  };
+  assert.deepEqual(
+    parsePreTransactionPOIs({ [listKey]: { [leafKey]: poi } }),
+    { [listKey]: { [leafKey]: poi } },
+  );
+  assert.throws(
+    () => parsePreTransactionPOIs([]),
+    BroadcasterRelayError,
+  );
+  assert.throws(
+    () => parsePreTransactionPOIs({ nope: {} }),
+    BroadcasterRelayError,
+  );
+  assert.throws(
+    () => parsePreTransactionPOIs({ [listKey]: [] }),
+    BroadcasterRelayError,
+  );
+  assert.throws(
+    () =>
+      parsePreTransactionPOIs({
+        [listKey]: {
+          [leafKey]: { ...poi, snarkProof: {} },
+        },
+      }),
     BroadcasterRelayError,
   );
 });
@@ -196,6 +252,34 @@ test("rejects unsupported networks on the quote route", async () => {
       assert.equal(
         ((await response.json()) as { code?: string }).code,
         "UNSUPPORTED_NETWORK",
+      );
+    },
+  );
+});
+
+test("rejects malformed pre-transaction POIs on the transact route", async () => {
+  await withServer(
+    { enabled: true, broadcaster: fakeRelay as never },
+    async (base) => {
+      const response = await fetch(
+        `${base}/api/light/v1/broadcaster/transact`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            network: "arbitrum",
+            txidVersion: "V2_PoseidonMerkle",
+            calldata: "0x1234",
+            quote: { id: quoteId },
+            nullifiers: [`0x${"11".repeat(32)}`],
+            preTransactionPOIs: [],
+          }),
+        },
+      );
+      assert.equal(response.status, 400);
+      assert.equal(
+        ((await response.json()) as { code?: string }).code,
+        "INVALID_PRE_TRANSACTION_POIS",
       );
     },
   );

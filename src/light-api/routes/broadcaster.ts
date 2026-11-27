@@ -11,6 +11,7 @@ import {
   parseAmount,
   parseCalldata,
   parseNullifiers,
+  parsePreTransactionPOIs,
   parseQuoteId,
   parseTokenHash,
   type BroadcasterQuote,
@@ -119,7 +120,7 @@ export const registerBroadcasterRoutes = (
           ...(body.preTransactionPOIs !== undefined
             ? {
                 preTransactionPOIsPerTxidLeafPerList:
-                  body.preTransactionPOIs as never,
+                  parsePreTransactionPOIs(body.preTransactionPOIs),
               }
             : {}),
         }),
