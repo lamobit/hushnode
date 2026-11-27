@@ -242,7 +242,7 @@ const poiProofPair = (
   value: unknown,
   name: string,
 ): [string, string] => {
-  if (!Array.isArray(value) || value.length !== 2) {
+  if (!Array.isArray(value) || value.length < 2 || value.length > 3) {
     throw invalidPoi(`${name} must contain two coordinates.`);
   }
   return [poiString(value[0], name), poiString(value[1], name)];
@@ -253,7 +253,7 @@ const poiProof = (value: unknown): PreTransactionPOI["snarkProof"] => {
     throw invalidPoi("snarkProof must be an object.");
   }
   const piB = value.pi_b;
-  if (!Array.isArray(piB) || piB.length !== 2) {
+  if (!Array.isArray(piB) || piB.length < 2 || piB.length > 3) {
     throw invalidPoi("snarkProof.pi_b must contain two rows.");
   }
   return {

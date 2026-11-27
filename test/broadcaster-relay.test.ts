@@ -123,6 +123,24 @@ test("validates pre-transaction POI payloads", () => {
     parsePreTransactionPOIs({ [listKey]: { [leafKey]: poi } }),
     { [listKey]: { [leafKey]: poi } },
   );
+  const rapidsnarkProof = {
+    ...poi,
+    snarkProof: {
+      pi_a: ["1", "2", "1"],
+      pi_b: [
+        ["3", "4"],
+        ["5", "6"],
+        ["1", "0"],
+      ],
+      pi_c: ["7", "8", "1"],
+    },
+  };
+  assert.deepEqual(
+    parsePreTransactionPOIs({
+      [listKey]: { [leafKey]: rapidsnarkProof },
+    }),
+    { [listKey]: { [leafKey]: poi } },
+  );
   assert.throws(
     () => parsePreTransactionPOIs([]),
     BroadcasterRelayError,
