@@ -14,6 +14,7 @@ import {
   parseTokenHash,
   tokenAddressFromHash,
 } from "../src/railgun/broadcaster-relay.js";
+import { BroadcasterTransportError } from "../src/railgun/broadcasters.js";
 
 const withServer = async (
   light: LightApiOptions,
@@ -60,6 +61,12 @@ const fakeRelay = {
   },
   async transact() {
     return { hash };
+  },
+  async startTransact() {
+    return { id: quoteId, status: "pending" as const };
+  },
+  async transactStatus() {
+    return { id: quoteId, status: "submitted" as const, hash };
   },
   async stop() {},
 };
@@ -189,6 +196,135 @@ test("rejects unknown quotes before touching the relay", async () => {
   );
 });
 
+test("returns immediately while the broadcaster submission is in flight", async () => {
+  let resolveSubmit: ((value: string) => void) | undefined;
+  let submitCalls = 0;
+  const relay = new BroadcasterRelay({
+    broadcasters: {
+      ensureChain: async () => undefined,
+      bestForToken: () => ({
+        railgunAddress: `0zk1${"q".repeat(100)}`,
+        tokenAddress: `0x${"11".repeat(20)}`,
+        tokenFee: { feesID: "fees-1", feePerUnitGas: "1000000000000000000" },
+      }),
+      submit: async () => {
+        submitCalls += 1;
+        return new Promise<string>((resolve) => {
+          resolveSubmit = resolve;
+        });
+      },
+      stop: async () => undefined,
+    } as never,
+    provider: (() => ({
+      feeData: async () => ({
+        baseFeePerGas: 10_000_000_000n,
+        maxFeePerGas: 20_000_000_000n,
+        maxPriorityFeePerGas: 1_000_000_000n,
+      }),
+    })) as never,
+  });
+  const quoted = await relay.quote({
+    network: "Ethereum" as never,
+    txidVersion: "V2_PoseidonMerkle" as never,
+    tokenHash,
+    amount: 10n ** 18n,
+    unshield: false,
+  });
+  const input = {
+    network: "Ethereum" as never,
+    txidVersion: "V2_PoseidonMerkle" as never,
+    calldata: "0x1234",
+    quoteId: quoted.id,
+    nullifiers: [`0x${"11".repeat(32)}`],
+  };
+
+  const startedAt = Date.now();
+  const status = await relay.startTransact(input);
+  assert.ok(Date.now() - startedAt < 250);
+  assert.deepEqual(status, { id: quoted.id, status: "pending" });
+
+  const duplicate = await relay.startTransact(input);
+  assert.deepEqual(duplicate, { id: quoted.id, status: "pending" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(submitCalls, 1);
+  assert.deepEqual(await relay.transactStatus(quoted.id), {
+    id: quoted.id,
+    status: "pending",
+  });
+
+  resolveSubmit?.(hash);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(await relay.transactStatus(quoted.id), {
+    id: quoted.id,
+    status: "submitted",
+    hash,
+  });
+});
+
+test("allows retrying a quote after a transient broadcaster failure", async () => {
+  let submitCalls = 0;
+  const relay = new BroadcasterRelay({
+    broadcasters: {
+      ensureChain: async () => undefined,
+      bestForToken: () => ({
+        railgunAddress: `0zk1${"q".repeat(100)}`,
+        tokenAddress: `0x${"11".repeat(20)}`,
+        tokenFee: { feesID: "fees-1", feePerUnitGas: "1000000000000000000" },
+      }),
+      submit: async () => {
+        submitCalls += 1;
+        if (submitCalls === 1) {
+          throw new BroadcasterTransportError("relay busy");
+        }
+        return hash;
+      },
+      stop: async () => undefined,
+    } as never,
+    provider: (() => ({
+      feeData: async () => ({
+        baseFeePerGas: 10_000_000_000n,
+        maxFeePerGas: 20_000_000_000n,
+        maxPriorityFeePerGas: 1_000_000_000n,
+      }),
+    })) as never,
+  });
+  const quoted = await relay.quote({
+    network: "Ethereum" as never,
+    txidVersion: "V2_PoseidonMerkle" as never,
+    tokenHash,
+    amount: 10n ** 18n,
+    unshield: false,
+  });
+  const input = {
+    network: "Ethereum" as never,
+    txidVersion: "V2_PoseidonMerkle" as never,
+    calldata: "0x1234",
+    quoteId: quoted.id,
+    nullifiers: [`0x${"11".repeat(32)}`],
+  };
+
+  await relay.startTransact(input);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(await relay.transactStatus(quoted.id), {
+    id: quoted.id,
+    status: "failed",
+    code: "BROADCASTER_UNAVAILABLE",
+    message: "The broadcaster network is temporarily unavailable.",
+  });
+
+  assert.deepEqual(await relay.startTransact(input), {
+    id: quoted.id,
+    status: "pending",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(submitCalls, 2);
+  assert.deepEqual(await relay.transactStatus(quoted.id), {
+    id: quoted.id,
+    status: "submitted",
+    hash,
+  });
+});
+
 test("broadcaster routes are disabled unless configured", async () => {
   await withServer({ enabled: true }, async (base) => {
     const response = await fetch(`${base}/api/light/v1/broadcaster/quote`, {
@@ -245,6 +381,67 @@ test("quotes and submits through the broadcaster routes", async () => {
       );
       assert.equal(transact.status, 200);
       assert.deepEqual(await transact.json(), { hash });
+    },
+  );
+});
+
+test("starts a submission asynchronously and exposes its status", async () => {
+  let statusCalls = 0;
+  const relay = {
+    ...fakeRelay,
+    async startTransact() {
+      return { id: quoteId, status: "pending" as const };
+    },
+    async transactStatus() {
+      statusCalls += 1;
+      return statusCalls === 1
+        ? { id: quoteId, status: "pending" as const }
+        : { id: quoteId, status: "submitted" as const, hash };
+    },
+  };
+  await withServer(
+    { enabled: true, broadcaster: relay as never },
+    async (base) => {
+      const body = {
+        network: "arbitrum",
+        txidVersion: "V2_PoseidonMerkle",
+        calldata: "0x1234",
+        quote: { id: quoteId },
+        nullifiers: [`0x${"11".repeat(32)}`],
+        async: true,
+      };
+      const started = await fetch(
+        `${base}/api/light/v1/broadcaster/transact`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        },
+      );
+      assert.equal(started.status, 202);
+      assert.deepEqual(await started.json(), {
+        id: quoteId,
+        status: "pending",
+      });
+
+      const pending = await fetch(
+        `${base}/api/light/v1/broadcaster/transact/${quoteId}`,
+      );
+      assert.equal(pending.status, 200);
+      assert.deepEqual(await pending.json(), {
+        id: quoteId,
+        status: "pending",
+      });
+
+      const submitted = await fetch(
+        `${base}/api/light/v1/broadcaster/transact/${quoteId}`,
+      );
+      assert.equal(submitted.status, 200);
+      assert.deepEqual(await submitted.json(), {
+        id: quoteId,
+        status: "submitted",
+        hash,
+      });
     },
   );
 });

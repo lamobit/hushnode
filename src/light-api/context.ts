@@ -27,6 +27,7 @@ export type LightRouteContext = {
     relay: BroadcasterRelay;
     quoteRate: SlidingWindowRateLimiter;
     transactRate: SlidingWindowRateLimiter;
+    transactStatusRate: SlidingWindowRateLimiter;
     jsonBody: RequestHandler;
   };
 };

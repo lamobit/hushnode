@@ -31,6 +31,7 @@ spending keys, mnemonics, and signatures stay on the phone.
 | `POST` | `/relay` | Forward a signed raw transaction; off by default, requires `LIGHT_RELAY_ENABLED=true` |
 | `POST` | `/broadcaster/quote` | Get a broadcaster quote; requires `LIGHT_BROADCASTER_ENABLED=true` |
 | `POST` | `/broadcaster/transact` | Submit a proven transaction through a broadcaster; idempotent per quote id |
+| `GET` | `/broadcaster/transact/:id` | Poll an asynchronous broadcaster submission |
 | `POST` | `/scan` | Start a remote note scan with a shareable viewing key; on by default once its token is set |
 | `GET` | `/scan/:jobId` | Read remote scan progress; returns notes for the address when done |
 | `DELETE` | `/scan/:jobId` | Cancel and clean up a remote scan job |
@@ -272,13 +273,12 @@ by that version.
   mnemonics, or spending/viewing keys and does not build, modify, or replace transactions. A
   successful broadcast does not mean final inclusion. `POST /relay` provides no authentication,
   idempotency, nonce management, balance check, or fee quote.
-- `broadcaster/quote` selects trusted Waku broadcasters by token and returns
-  `{ id, network, tokenHash, feeRecipient, fee, minGasPrice, expiresAt }`; a quote is valid 90
-  seconds, the fee is estimated at 600k gas (800k for unshield) and capped at 10% of the amount.
-  `broadcaster/transact` accepts only a quote `id`, calldata, and `nullifiers`; the server restores
-  the broadcaster and fee from the in-memory quote, and a duplicate `id` returns the original hash.
-  Neither endpoint touches private keys. `preTransactionPOIs` must come from the caller, and a
-  transaction without a PPOI proof may be rejected by the broadcaster.
+- `broadcaster/quote` returns `{ id, network, tokenHash, feeRecipient, fee, minGasPrice, expiresAt }`
+  for a trusted Waku broadcaster; quotes last 90 seconds and fees are capped at 10% of the amount.
+  `broadcaster/transact` accepts only a quote `id`, calldata, and `nullifiers`. With `async: true`
+  it returns `202 { id, status: "pending" }` and `GET /broadcaster/transact/:id` reports the
+  terminal hash or failure, keeping Waku's two-minute wait out of the HTTP request. Duplicate
+  starts are idempotent; `preTransactionPOIs` must come from the caller.
 
 ## Examples
 

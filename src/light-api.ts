@@ -62,6 +62,7 @@ const READ_RATE_WINDOW_MS = 60_000;
 const BROADCASTER_RATE_WINDOW_MS = 60_000;
 const DEFAULT_BROADCASTER_QUOTE_RATE_PER_MINUTE = 30;
 const DEFAULT_BROADCASTER_TRANSACT_RATE_PER_MINUTE = 10;
+const BROADCASTER_STATUS_RATE_PER_MINUTE = 180;
 const MAX_BROADCASTER_RATE_PER_MINUTE = 600;
 
 const clamp = (value: number, minimum: number, maximum: number): number =>
@@ -151,6 +152,11 @@ export const createLightApiRouter = (options: LightApiOptions): Router => {
             1,
             MAX_BROADCASTER_RATE_PER_MINUTE,
           ),
+          BROADCASTER_RATE_WINDOW_MS,
+          4_096,
+        ),
+        transactStatusRate: new SlidingWindowRateLimiter(
+          BROADCASTER_STATUS_RATE_PER_MINUTE,
           BROADCASTER_RATE_WINDOW_MS,
           4_096,
         ),

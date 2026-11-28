@@ -21,6 +21,8 @@ import {
 const log = createLogger("broadcaster-relay");
 
 const QUOTE_TTL_MS = 90_000;
+const BROADCASTER_WAIT_MS = 5_000;
+const BROADCASTER_POLL_MS = 250;
 const MAX_FEE_BPS = 1_000n;
 const MAX_QUOTES = 512;
 const MAX_DECIMAL_UINT256_DIGITS = 78;
@@ -79,11 +81,27 @@ export type BroadcasterTransactInput = {
   preTransactionPOIsPerTxidLeafPerList?: PreTransactionPOIsPerTxidLeafPerList;
 };
 
+export type BroadcasterTransactStatus =
+  | { id: string; status: "pending" }
+  | { id: string; status: "submitted"; hash: string }
+  | { id: string; status: "failed"; code: string; message: string };
+
+type TransactJob = {
+  status: "pending" | "submitted" | "failed";
+  startedAt: number;
+  httpStatus?: number;
+  hash?: string;
+  code?: string;
+  message?: string;
+  promise?: Promise<void>;
+};
+
 type StoredQuote = BroadcasterQuote & {
   feesID: string;
   tokenAddress: string;
   usedAt?: number;
   hash?: string;
+  transact?: TransactJob;
 };
 
 type RelayDependencies = {
@@ -354,9 +372,10 @@ export class BroadcasterRelay {
     } catch (error) {
       throw this.unavailable(error, "chain setup");
     }
-    const broadcaster = this.deps.broadcasters.bestForToken(
+    const broadcaster = await this.waitForBroadcaster(
       chain,
       tokenAddress,
+      BROADCASTER_WAIT_MS,
     );
     if (!broadcaster) {
       throw new BroadcasterRelayError(
@@ -407,9 +426,66 @@ export class BroadcasterRelay {
     return publicQuote(stored);
   }
 
+  /**
+   * Starts a submission and returns immediately. Waku broadcasters can take
+   * up to two minutes to answer; holding the HTTP request open for that long
+   * trips reverse-proxy and client timeouts, making a successful submission
+   * look like a failure.
+   */
+  async startTransact(
+    input: BroadcasterTransactInput,
+  ): Promise<BroadcasterTransactStatus> {
+    const stored = this.claim(input);
+    return this.begin(stored, input);
+  }
+
+  async transactStatus(
+    quoteId: string,
+  ): Promise<BroadcasterTransactStatus> {
+    this.prune(Date.now());
+    const stored = this.quotes.get(quoteId);
+    if (!stored || (!stored.transact && !stored.hash)) {
+      throw new BroadcasterRelayError(
+        404,
+        "QUOTE_NOT_FOUND",
+        "The quote is unknown or this transaction was not started.",
+      );
+    }
+    return this.statusOf(stored);
+  }
+
+  /**
+   * Legacy blocking submission. New clients should use `startTransact` plus
+   * `transactStatus` so mobile and proxy timeouts cannot cancel the wait.
+   */
   async transact(
     input: BroadcasterTransactInput,
   ): Promise<{ hash: string }> {
+    const stored = this.claim(input);
+    this.begin(stored, input);
+    const job = stored.transact;
+    if (!job) {
+      throw new BroadcasterRelayError(
+        500,
+        "TRANSACT_UNAVAILABLE",
+        "The transaction could not be started.",
+      );
+    }
+    if (job.status === "submitted" && job.hash) {
+      return { hash: job.hash };
+    }
+    if (job.promise) await job.promise;
+    if (job.status === "submitted" && job.hash) {
+      return { hash: job.hash };
+    }
+    throw new BroadcasterRelayError(
+      job.httpStatus ?? 502,
+      job.code ?? "BROADCASTER_FAILED",
+      job.message ?? "The broadcaster rejected the transaction.",
+    );
+  }
+
+  private claim(input: BroadcasterTransactInput): StoredQuote {
     const now = Date.now();
     this.prune(now);
     const stored = this.quotes.get(input.quoteId);
@@ -420,20 +496,22 @@ export class BroadcasterRelay {
         "The quote is unknown or has expired.",
       );
     }
+    if (stored.transact) {
+      const retryable =
+        stored.transact.status === "failed" &&
+        stored.transact.code === "BROADCASTER_UNAVAILABLE" &&
+        stored.expiresAt > now;
+      if (!retryable) return stored;
+      stored.transact = undefined;
+      stored.usedAt = undefined;
+    }
+    if (stored.hash) return stored;
     if (stored.expiresAt <= now) {
       this.quotes.delete(stored.id);
       throw new BroadcasterRelayError(
         410,
         "QUOTE_EXPIRED",
         "The quote has expired; request a new one.",
-      );
-    }
-    if (stored.hash) return { hash: stored.hash };
-    if (stored.usedAt) {
-      throw new BroadcasterRelayError(
-        409,
-        "QUOTE_IN_FLIGHT",
-        "This quote is already being submitted.",
       );
     }
     if (
@@ -456,31 +534,60 @@ export class BroadcasterRelay {
         "The quote's gas price has changed.",
       );
     }
+    return stored;
+  }
 
-    const chain = chainFor(networkFor(stored.network));
-    try {
-      await this.deps.broadcasters.ensureChain(chain);
-    } catch (error) {
-      throw this.unavailable(error, "chain setup");
+  private begin(
+    stored: StoredQuote,
+    input: BroadcasterTransactInput,
+  ): BroadcasterTransactStatus {
+    if (!stored.transact) {
+      if (stored.hash) return this.statusOf(stored);
+      const job: TransactJob = {
+        status: "pending",
+        startedAt: Date.now(),
+      };
+      stored.usedAt = job.startedAt;
+      stored.transact = job;
+      job.promise = this.runTransact(stored, input, job).catch((error) => {
+        log.error(`broadcaster job crashed for ${stored.id.slice(0, 8)}`, error);
+        job.status = "failed";
+        job.httpStatus = 502;
+        job.code = "BROADCASTER_FAILED";
+        job.message = "The broadcaster rejected the transaction.";
+      });
     }
-    const current = this.deps.broadcasters.bestForToken(
-      chain,
-      stored.tokenAddress,
-    );
-    if (
-      !current ||
-      current.tokenFee.feesID !== stored.feesID ||
-      current.railgunAddress !== stored.feeRecipient
-    ) {
-      throw new BroadcasterRelayError(
-        409,
-        "QUOTE_STALE",
-        "The broadcaster changed; request a new quote.",
+    return this.statusOf(stored);
+  }
+
+  private async runTransact(
+    stored: StoredQuote,
+    input: BroadcasterTransactInput,
+    job: TransactJob,
+  ): Promise<void> {
+    try {
+      const chain = chainFor(networkFor(stored.network));
+      try {
+        await this.deps.broadcasters.ensureChain(chain);
+      } catch (error) {
+        throw this.unavailable(error, "chain setup");
+      }
+      const current = await this.waitForBroadcaster(
+        chain,
+        stored.tokenAddress,
+        2_000,
       );
-    }
-
-    stored.usedAt = now;
-    try {
+      if (
+        !current ||
+        current.tokenFee.feesID !== stored.feesID ||
+        current.railgunAddress !== stored.feeRecipient
+      ) {
+        throw new BroadcasterRelayError(
+          409,
+          "QUOTE_STALE",
+          "The broadcaster changed; request a new quote.",
+        );
+      }
       const hash = await this.deps.broadcasters.submit({
         txidVersion: stored.txidVersion,
         to: NETWORK_CONFIG[stored.network].proxyContract,
@@ -497,29 +604,76 @@ export class BroadcasterRelay {
         throw new Error("The broadcaster returned an invalid transaction hash.");
       }
       stored.hash = hash;
+      job.status = "submitted";
+      job.hash = hash;
       log.info(`submitted ${stored.id.slice(0, 8)} as ${hash}`);
-      return { hash };
     } catch (error) {
       stored.usedAt = undefined;
-      if (error instanceof BroadcasterRelayError) throw error;
-      if (error instanceof BroadcasterTransportError) {
-        log.warn(
-          `broadcast transport failed for ${stored.id.slice(0, 8)}`,
-          error,
-        );
-        throw new BroadcasterRelayError(
-          503,
-          "BROADCASTER_UNAVAILABLE",
-          "The broadcaster network is temporarily unavailable.",
-        );
-      }
-      log.error(`broadcast failed for ${stored.id.slice(0, 8)}`, error);
-      throw new BroadcasterRelayError(
-        502,
-        "BROADCASTER_FAILED",
-        "The broadcaster rejected the transaction.",
+      const failure = this.submitFailure(error, stored.id);
+      job.status = "failed";
+      job.httpStatus = failure.status;
+      job.code = failure.code;
+      job.message = failure.message;
+    }
+  }
+
+  private submitFailure(
+    error: unknown,
+    quoteId: string,
+  ): BroadcasterRelayError {
+    if (error instanceof BroadcasterRelayError) return error;
+    if (error instanceof BroadcasterTransportError) {
+      log.warn(`broadcast transport failed for ${quoteId.slice(0, 8)}`, error);
+      return new BroadcasterRelayError(
+        503,
+        "BROADCASTER_UNAVAILABLE",
+        "The broadcaster network is temporarily unavailable.",
       );
     }
+    log.error(`broadcast failed for ${quoteId.slice(0, 8)}`, error);
+    return new BroadcasterRelayError(
+      502,
+      "BROADCASTER_FAILED",
+      "The broadcaster rejected the transaction.",
+    );
+  }
+
+  private async waitForBroadcaster(
+    chain: ReturnType<typeof chainFor>,
+    tokenAddress: string,
+    timeoutMs: number,
+  ): Promise<ReturnType<BroadcasterNetwork["bestForToken"]>> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const broadcaster = this.deps.broadcasters.bestForToken(
+        chain,
+        tokenAddress,
+      );
+      if (broadcaster || Date.now() >= deadline) return broadcaster;
+      await new Promise((resolve) => setTimeout(resolve, BROADCASTER_POLL_MS));
+    }
+  }
+
+  private statusOf(stored: StoredQuote): BroadcasterTransactStatus {
+    const job = stored.transact;
+    if (!job) {
+      if (stored.hash) {
+        return { id: stored.id, status: "submitted", hash: stored.hash };
+      }
+      return { id: stored.id, status: "pending" };
+    }
+    if (job.status === "submitted" && job.hash) {
+      return { id: stored.id, status: "submitted", hash: job.hash };
+    }
+    if (job.status === "failed") {
+      return {
+        id: stored.id,
+        status: "failed",
+        code: job.code ?? "BROADCASTER_FAILED",
+        message: job.message ?? "The broadcaster rejected the transaction.",
+      };
+    }
+    return { id: stored.id, status: "pending" };
   }
 
   async stop(): Promise<void> {
