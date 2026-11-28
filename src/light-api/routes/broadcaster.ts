@@ -13,6 +13,7 @@ import {
   parseNullifiers,
   parsePreTransactionPOIs,
   parseQuoteId,
+  parseQuoteTerms,
   parseTokenHash,
   type BroadcasterQuote,
   type BroadcasterTransactInput,
@@ -63,11 +64,13 @@ const parseTransactInput = (
   body: Record<string, unknown>,
 ): BroadcasterTransactInput => {
   const quote = asRecord(body.quote);
+  const terms = parseQuoteTerms(quote);
   return {
     network: parseNetwork(body.network),
     txidVersion: parseTxidVersion(body.txidVersion),
     calldata: parseCalldata(body.calldata),
     quoteId: parseQuoteId(quote.id),
+    ...(terms ? { quote: terms } : {}),
     nullifiers: parseNullifiers(body.nullifiers),
     ...(body.overallBatchMinGasPrice !== undefined
       ? {

@@ -16,6 +16,7 @@ const log = createLogger("broadcasters");
 
 const MAX_PENDING_OPERATIONS = 128;
 const MAX_QUEUE_WAIT_MS = 30_000;
+const MIN_RECONNECT_INTERVAL_MS = 20_000;
 
 export class BroadcasterTransportError extends Error {
   constructor(message: string) {
@@ -50,6 +51,8 @@ export class BroadcasterNetwork {
   private activeChain: Chain | undefined;
   private started = false;
   private connected = false;
+  private lastStatus: string | undefined;
+  private lastReconnectAt = 0;
   private queue: Promise<unknown> = Promise.resolve();
   private pendingOperations = 0;
 
@@ -77,6 +80,7 @@ export class BroadcasterNetwork {
             additionalDirectPeers: config.additionalDirectPeers,
           },
           (_chain, status) => {
+            this.lastStatus = status;
             this.connected = status === "Connected";
           },
         );
@@ -85,22 +89,69 @@ export class BroadcasterNetwork {
       }
       if (sameChain(this.activeChain, chain)) return;
       this.connected = false;
+      this.lastStatus = undefined;
       await WakuBroadcasterClient.setChain(chain);
       this.activeChain = chain;
     });
+  }
+
+  /**
+   * Restarts the Waku session when fee traffic has stalled. The SDK reconnects on
+   * its own for hard disconnects, but a session that stays in `Searching` keeps
+   * serving an empty fee cache until it is re-initialized.
+   */
+  async reconnect(chain: Chain): Promise<void> {
+    if (!this.started || !sameChain(this.activeChain, chain)) return;
+    if (Date.now() - this.lastReconnectAt < MIN_RECONNECT_INTERVAL_MS) return;
+    this.lastReconnectAt = Date.now();
+    this.connected = false;
+    log.warn("restarting broadcaster session", {
+      status: this.lastStatus ?? "unknown",
+    });
+    await this.exclusive(async () => {
+      await WakuBroadcasterClient.tryReconnect().catch((error: unknown) => {
+        log.warn("broadcaster reconnect failed", error);
+      });
+    }, true);
   }
 
   bestForToken(
     chain: Chain,
     tokenAddress: string,
   ): SelectedBroadcaster | undefined {
-    if (!this.isConnected(chain)) return undefined;
     try {
       return WakuBroadcasterClient.findBestBroadcaster(
         chain,
         tokenAddress.toLowerCase(),
         false,
         false,
+      );
+    } catch (error) {
+      log.warn("broadcaster lookup failed", error);
+      return undefined;
+    }
+  }
+
+  /**
+   * Looks up a specific broadcaster so a quote stays usable after a cheaper
+   * broadcaster appears. Returns undefined when that broadcaster no longer
+   * advertises an unexpired fee for the token.
+   */
+  broadcasterFor(
+    chain: Chain,
+    tokenAddress: string,
+    railgunAddress: string,
+  ): SelectedBroadcaster | undefined {
+    if (!this.started || !sameChain(this.activeChain, chain)) return undefined;
+    try {
+      const candidates = WakuBroadcasterClient.findBroadcastersForToken(
+        chain,
+        tokenAddress.toLowerCase(),
+        false,
+      );
+      return candidates?.find(
+        (candidate: SelectedBroadcaster) =>
+          candidate.railgunAddress === railgunAddress,
       );
     } catch (error) {
       log.warn("broadcaster lookup failed", error);
@@ -138,6 +189,7 @@ export class BroadcasterNetwork {
         });
         this.started = false;
         this.connected = false;
+        this.lastStatus = undefined;
         this.activeChain = undefined;
       },
       true,

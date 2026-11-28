@@ -325,6 +325,172 @@ test("allows retrying a quote after a transient broadcaster failure", async () =
   });
 });
 
+const fakeProvider = {
+  feeData: async () => ({
+    baseFeePerGas: 10_000_000_000n,
+    maxFeePerGas: 20_000_000_000n,
+    maxPriorityFeePerGas: 1_000_000_000n,
+  }),
+};
+
+const fakeBroadcaster = (feesID: string, address = `0zk1${"q".repeat(100)}`) => ({
+  railgunAddress: address,
+  tokenAddress: `0x${"11".repeat(20)}`,
+  tokenFee: { feesID, feePerUnitGas: "1000000000000000000" },
+});
+
+test("adopts the live fee message id instead of failing the quote", async () => {
+  const submitted: string[] = [];
+  let feesID = "fees-1";
+  const relay = new BroadcasterRelay({
+    broadcasters: {
+      ensureChain: async () => undefined,
+      bestForToken: () => fakeBroadcaster(feesID),
+      broadcasterFor: () => fakeBroadcaster(feesID),
+      submit: async (request: { feesID: string }) => {
+        submitted.push(request.feesID);
+        return hash;
+      },
+      stop: async () => undefined,
+    } as never,
+    provider: (() => fakeProvider) as never,
+  });
+  const quoted = await relay.quote({
+    network: "Ethereum" as never,
+    txidVersion: "V2_PoseidonMerkle" as never,
+    tokenHash,
+    amount: 10n ** 18n,
+    unshield: false,
+  });
+  feesID = "fees-2";
+  await relay.startTransact({
+    network: "Ethereum" as never,
+    txidVersion: "V2_PoseidonMerkle" as never,
+    calldata: "0x1234",
+    quoteId: quoted.id,
+    nullifiers: [`0x${"11".repeat(32)}`],
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(submitted, ["fees-2"]);
+  assert.deepEqual(await relay.transactStatus(quoted.id), {
+    id: quoted.id,
+    status: "submitted",
+    hash,
+  });
+});
+
+test("recovers a quote the instance never stored from caller terms", async () => {
+  const submitted: string[] = [];
+  const relay = new BroadcasterRelay({
+    broadcasters: {
+      ensureChain: async () => undefined,
+      bestForToken: () => fakeBroadcaster("fees-live"),
+      broadcasterFor: () => fakeBroadcaster("fees-live"),
+      submit: async (request: { feesID: string }) => {
+        submitted.push(request.feesID);
+        return hash;
+      },
+      stop: async () => undefined,
+    } as never,
+    provider: (() => fakeProvider) as never,
+  });
+  const status = await relay.startTransact({
+    network: "Ethereum" as never,
+    txidVersion: "V2_PoseidonMerkle" as never,
+    calldata: "0x1234",
+    quoteId: "b".repeat(32),
+    quote: {
+      tokenHash,
+      feeRecipient: `0zk1${"q".repeat(100)}`,
+      fee: 1_000n,
+      minGasPrice: 2_000_000n,
+      expiresAt: Date.now() + 60_000,
+    },
+    nullifiers: [`0x${"11".repeat(32)}`],
+    overallBatchMinGasPrice: 2_000_000n,
+  });
+  assert.deepEqual(status, { id: "b".repeat(32), status: "pending" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(submitted, ["fees-live"]);
+});
+
+test("reports a missing broadcaster instead of a stale quote", async () => {
+  let available = true;
+  const relay = new BroadcasterRelay({
+    broadcasters: {
+      ensureChain: async () => undefined,
+      bestForToken: () => (available ? fakeBroadcaster("fees-1") : undefined),
+      broadcasterFor: () => (available ? fakeBroadcaster("fees-1") : undefined),
+      submit: async () => hash,
+      stop: async () => undefined,
+    } as never,
+    provider: (() => fakeProvider) as never,
+    timings: { submitWaitMs: 30 },
+  });
+  const quoted = await relay.quote({
+    network: "Ethereum" as never,
+    txidVersion: "V2_PoseidonMerkle" as never,
+    tokenHash,
+    amount: 10n ** 18n,
+    unshield: false,
+  });
+  available = false;
+  await relay.startTransact({
+    network: "Ethereum" as never,
+    txidVersion: "V2_PoseidonMerkle" as never,
+    calldata: "0x1234",
+    quoteId: quoted.id,
+    nullifiers: [`0x${"11".repeat(32)}`],
+  });
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  assert.deepEqual(await relay.transactStatus(quoted.id), {
+    id: quoted.id,
+    status: "failed",
+    code: "BROADCASTER_UNAVAILABLE",
+    message: "No trusted broadcaster is reachable right now; try again.",
+  });
+});
+
+test("reports a stale quote only when the quoted broadcaster is replaced", async () => {
+  let quotedAvailable = true;
+  const quoted = fakeBroadcaster("fees-1");
+  const replacement = fakeBroadcaster("fees-2", `0zk1${"r".repeat(100)}`);
+  const relay = new BroadcasterRelay({
+    broadcasters: {
+      ensureChain: async () => undefined,
+      bestForToken: () => (quotedAvailable ? quoted : replacement),
+      broadcasterFor: () => (quotedAvailable ? quoted : undefined),
+      submit: async () => hash,
+      stop: async () => undefined,
+    } as never,
+    provider: (() => fakeProvider) as never,
+    timings: { submitWaitMs: 2_000, replacedAfterMs: 20 },
+  });
+  const created = await relay.quote({
+    network: "Ethereum" as never,
+    txidVersion: "V2_PoseidonMerkle" as never,
+    tokenHash,
+    amount: 10n ** 18n,
+    unshield: false,
+  });
+  quotedAvailable = false;
+  const status = await relay.startTransact({
+    network: "Ethereum" as never,
+    txidVersion: "V2_PoseidonMerkle" as never,
+    calldata: "0x1234",
+    quoteId: created.id,
+    nullifiers: [`0x${"11".repeat(32)}`],
+  });
+  assert.deepEqual(status, { id: created.id, status: "pending" });
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  assert.deepEqual(await relay.transactStatus(created.id), {
+    id: created.id,
+    status: "failed",
+    code: "QUOTE_STALE",
+    message: "The quoted broadcaster is no longer available for this token.",
+  });
+});
+
 test("broadcaster routes are disabled unless configured", async () => {
   await withServer({ enabled: true }, async (base) => {
     const response = await fetch(`${base}/api/light/v1/broadcaster/quote`, {

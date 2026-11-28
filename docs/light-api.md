@@ -274,11 +274,11 @@ by that version.
   successful broadcast does not mean final inclusion. `POST /relay` provides no authentication,
   idempotency, nonce management, balance check, or fee quote.
 - `broadcaster/quote` returns `{ id, network, tokenHash, feeRecipient, fee, minGasPrice, expiresAt }`
-  for a trusted Waku broadcaster; quotes last 90 seconds and fees are capped at 10% of the amount.
-  `broadcaster/transact` accepts only a quote `id`, calldata, and `nullifiers`. With `async: true`
-  it returns `202 { id, status: "pending" }` and `GET /broadcaster/transact/:id` reports the
-  terminal hash or failure, keeping Waku's two-minute wait out of the HTTP request. Duplicate
-  starts are idempotent; `preTransactionPOIs` must come from the caller.
+  for a trusted Waku broadcaster; quotes last 15 minutes and fees are capped at 10% of the amount.
+  `broadcaster/transact` takes that quote, calldata, and `nullifiers`; echoing the terms lets a
+  restarted instance relay a quote it never stored, after re-checking the live fee schedule. With
+  `async: true` it returns `202` and `GET /broadcaster/transact/:id` reports the terminal hash or
+  failure, keeping Waku's two-minute wait out of the request. Duplicate starts are idempotent.
 
 ## Examples
 

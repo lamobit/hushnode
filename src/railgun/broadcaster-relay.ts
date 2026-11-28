@@ -4,6 +4,7 @@ import {
   NETWORK_CONFIG,
   TXIDVersion,
   getEVMGasTypeForTransaction,
+  type Chain,
   type NetworkName,
   type PreTransactionPOI,
   type PreTransactionPOIsPerTxidLeafPerList,
@@ -15,14 +16,22 @@ import { createLogger } from "../logger.js";
 import { chainFor, networkFor } from "../networks.js";
 import {
   BroadcasterTransportError,
+  type BroadcasterSubmission,
   type BroadcasterNetwork,
 } from "./broadcasters.js";
 
 const log = createLogger("broadcaster-relay");
 
-const QUOTE_TTL_MS = 90_000;
+/**
+ * A quote only freezes the broadcaster's fee terms, which are re-verified at
+ * submission time, so it can stay usable across on-device proving and a slow
+ * review. Quotes are dropped once they are this old (plus a grace period).
+ */
+const QUOTE_TTL_MS = 15 * 60_000;
 const BROADCASTER_WAIT_MS = 5_000;
+const SUBMIT_BROADCASTER_WAIT_MS = 60_000;
 const BROADCASTER_POLL_MS = 250;
+const RECONNECT_AFTER_MS = 8_000;
 const MAX_FEE_BPS = 1_000n;
 const MAX_QUOTES = 512;
 const MAX_DECIMAL_UINT256_DIGITS = 78;
@@ -76,9 +85,23 @@ export type BroadcasterTransactInput = {
   txidVersion: TXIDVersion;
   calldata: string;
   quoteId: string;
+  /**
+   * The full quote the caller proved against. Used when the in-memory quote
+   * record is gone (process restart, eviction) so a paid-for proof is not
+   * discarded just because this instance never saw the quote request.
+   */
+  quote?: BroadcasterQuoteTerms;
   nullifiers: string[];
   overallBatchMinGasPrice?: bigint;
   preTransactionPOIsPerTxidLeafPerList?: PreTransactionPOIsPerTxidLeafPerList;
+};
+
+export type BroadcasterQuoteTerms = {
+  tokenHash: string;
+  feeRecipient: string;
+  fee: bigint;
+  minGasPrice: bigint;
+  expiresAt: number;
 };
 
 export type BroadcasterTransactStatus =
@@ -99,17 +122,52 @@ type TransactJob = {
 type StoredQuote = BroadcasterQuote & {
   feesID: string;
   tokenAddress: string;
+  feePerUnitGas: bigint;
+  issuedAt: number;
+  /** Missing for quotes recovered from caller terms, which cannot be re-priced. */
+  gasDetails?: TransactionGasDetails;
   usedAt?: number;
   hash?: string;
   transact?: TransactJob;
 };
 
-type RelayDependencies = {
-  broadcasters: BroadcasterNetwork;
-  provider: (network: NetworkName) => LightRpcProvider;
+type BroadcasterLookup = ReturnType<BroadcasterNetwork["bestForToken"]>;
+
+type RelayBroadcasters = {
+  ensureChain: (chain: Chain) => Promise<void>;
+  bestForToken: (chain: Chain, tokenAddress: string) => BroadcasterLookup;
+  broadcasterFor?: (
+    chain: Chain,
+    tokenAddress: string,
+    railgunAddress: string,
+  ) => BroadcasterLookup;
+  reconnect?: (chain: Chain) => Promise<void>;
+  submit: (request: BroadcasterSubmission) => Promise<string>;
+  stop: () => Promise<void>;
 };
 
+type RelayDependencies = {
+  broadcasters: RelayBroadcasters;
+  provider: (network: NetworkName) => LightRpcProvider;
+  /** Overridable wait budgets; defaults match the production relay. */
+  timings?: {
+    quoteWaitMs?: number;
+    submitWaitMs?: number;
+    replacedAfterMs?: number;
+  };
+};
+
+const quoteWait = (deps: RelayDependencies): number =>
+  deps.timings?.quoteWaitMs ?? BROADCASTER_WAIT_MS;
+const submitWait = (deps: RelayDependencies): number =>
+  deps.timings?.submitWaitMs ?? SUBMIT_BROADCASTER_WAIT_MS;
+const replacedAfter = (deps: RelayDependencies): number =>
+  deps.timings?.replacedAfterMs ?? 10_000;
+
 const strip0x = (value: string): string => value.replace(/^0x/, "");
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
 
 export const parseTokenHash = (value: unknown): string => {
   const hash =
@@ -215,6 +273,49 @@ export const parseQuoteId = (value: unknown): string => {
     );
   }
   return id;
+};
+
+const RAILGUN_ADDRESS = /^0zk1[0-9a-z]{20,300}$/;
+
+const parseQuoteField = <T>(
+  value: unknown,
+  parse: (input: unknown) => T,
+): T | undefined => {
+  try {
+    return parse(value);
+  } catch {
+    return undefined;
+  }
+};
+
+/**
+ * Parses the quote terms echoed by the caller. They are advisory: submission
+ * only uses them when this instance has no record of the quote id, and the
+ * broadcaster's live terms are always re-checked before relaying.
+ */
+export const parseQuoteTerms = (
+  value: unknown,
+): BroadcasterQuoteTerms | undefined => {
+  if (!isPlainRecord(value)) return undefined;
+  const feeRecipient =
+    typeof value.feeRecipient === "string" ? value.feeRecipient.trim() : "";
+  if (!RAILGUN_ADDRESS.test(feeRecipient)) return undefined;
+  const tokenHash = parseQuoteField(value.tokenHash, parseTokenHash);
+  const fee = parseQuoteField(value.fee, parseAmount);
+  const minGasPrice = parseQuoteField(value.minGasPrice, parseAmount);
+  const expiresAt =
+    typeof value.expiresAt === "number" && Number.isSafeInteger(value.expiresAt)
+      ? value.expiresAt
+      : undefined;
+  if (
+    tokenHash === undefined ||
+    fee === undefined ||
+    minGasPrice === undefined ||
+    expiresAt === undefined
+  ) {
+    return undefined;
+  }
+  return { tokenHash, feeRecipient, fee, minGasPrice, expiresAt };
 };
 
 const invalidPoi = (message: string): BroadcasterRelayError =>
@@ -375,7 +476,7 @@ export class BroadcasterRelay {
     const broadcaster = await this.waitForBroadcaster(
       chain,
       tokenAddress,
-      BROADCASTER_WAIT_MS,
+      quoteWait(this.deps),
     );
     if (!broadcaster) {
       throw new BroadcasterRelayError(
@@ -418,6 +519,9 @@ export class BroadcasterRelay {
       expiresAt: now + QUOTE_TTL_MS,
       feesID: broadcaster.tokenFee.feesID,
       tokenAddress,
+      feePerUnitGas: BigInt(broadcaster.tokenFee.feePerUnitGas),
+      issuedAt: now,
+      gasDetails: details,
     };
     this.quotes.set(stored.id, stored);
     log.info(
@@ -488,12 +592,12 @@ export class BroadcasterRelay {
   private claim(input: BroadcasterTransactInput): StoredQuote {
     const now = Date.now();
     this.prune(now);
-    const stored = this.quotes.get(input.quoteId);
+    const stored = this.quotes.get(input.quoteId) ?? this.adopt(input, now);
     if (!stored) {
       throw new BroadcasterRelayError(
         404,
         "QUOTE_NOT_FOUND",
-        "The quote is unknown or has expired.",
+        "The quote is unknown or has expired; request a new one.",
       );
     }
     if (stored.transact) {
@@ -537,6 +641,63 @@ export class BroadcasterRelay {
     return stored;
   }
 
+  /**
+   * Rebuilds an unknown quote from the caller's own terms. Quotes live in
+   * process memory, so a restart or a second instance would otherwise reject a
+   * transaction the caller already paid proving time for. The rebuilt quote is
+   * only accepted while the fee recipient still advertises this token; the
+   * broadcaster itself re-checks that the calldata pays its live fee before
+   * relaying, so these terms cannot be used to underpay it.
+   */
+  private adopt(
+    input: BroadcasterTransactInput,
+    now: number,
+  ): StoredQuote | undefined {
+    const terms = input.quote;
+    if (!terms) return undefined;
+    if (terms.expiresAt <= now) {
+      throw new BroadcasterRelayError(
+        410,
+        "QUOTE_EXPIRED",
+        "The quote has expired; request a new one.",
+      );
+    }
+    const network = networkFor(input.network);
+    const chain = chainFor(network);
+    const tokenAddress = tokenAddressFromHash(terms.tokenHash);
+    const broadcaster = this.deps.broadcasters.broadcasterFor?.(
+      chain,
+      tokenAddress,
+      terms.feeRecipient,
+    );
+    if (!broadcaster) {
+      throw new BroadcasterRelayError(
+        409,
+        "QUOTE_STALE",
+        "That broadcaster is no longer quoting this token; request a new quote.",
+      );
+    }
+    const stored: StoredQuote = {
+      id: input.quoteId,
+      network: input.network,
+      txidVersion: input.txidVersion,
+      tokenHash: terms.tokenHash,
+      feeRecipient: terms.feeRecipient,
+      fee: terms.fee,
+      minGasPrice: terms.minGasPrice,
+      expiresAt: terms.expiresAt,
+      feesID: broadcaster.tokenFee.feesID,
+      tokenAddress,
+      feePerUnitGas: BigInt(broadcaster.tokenFee.feePerUnitGas),
+      issuedAt: now,
+    };
+    this.quotes.set(stored.id, stored);
+    log.info(
+      `recovered quote ${stored.id.slice(0, 8)} on ${input.network} from caller terms`,
+    );
+    return stored;
+  }
+
   private begin(
     stored: StoredQuote,
     input: BroadcasterTransactInput,
@@ -572,21 +733,49 @@ export class BroadcasterRelay {
       } catch (error) {
         throw this.unavailable(error, "chain setup");
       }
-      const current = await this.waitForBroadcaster(
+      const current = await this.waitForQuotedBroadcaster(
         chain,
-        stored.tokenAddress,
-        2_000,
+        stored,
+        submitWait(this.deps),
       );
-      if (
-        !current ||
-        current.tokenFee.feesID !== stored.feesID ||
-        current.railgunAddress !== stored.feeRecipient
-      ) {
+      if (!current) {
+        throw new BroadcasterRelayError(
+          503,
+          "BROADCASTER_UNAVAILABLE",
+          "No trusted broadcaster is reachable right now; try again.",
+        );
+      }
+      if (current.railgunAddress !== stored.feeRecipient) {
         throw new BroadcasterRelayError(
           409,
           "QUOTE_STALE",
-          "The broadcaster changed; request a new quote.",
+          "The quoted broadcaster is no longer available for this token.",
         );
+      }
+      if (stored.gasDetails) {
+        const required = await calculateBroadcasterFeeERC20Amount(
+          {
+            tokenAddress: current.tokenAddress,
+            feePerUnitGas: BigInt(current.tokenFee.feePerUnitGas),
+          },
+          stored.gasDetails,
+        );
+        if (required.amount > stored.fee) {
+          throw new BroadcasterRelayError(
+            409,
+            "QUOTE_STALE",
+            "The broadcaster raised its fee; request a new quote.",
+          );
+        }
+      }
+      if (current.tokenFee.feesID !== stored.feesID) {
+        /*
+         * Broadcasters re-publish fee messages with a new id every few
+         * seconds. The fee the proof pays is unchanged, so adopt the live id
+         * instead of failing a quote prepared minutes earlier.
+         */
+        stored.feesID = current.tokenFee.feesID;
+        stored.feePerUnitGas = BigInt(current.tokenFee.feePerUnitGas);
       }
       const hash = await this.deps.broadcasters.submit({
         txidVersion: stored.txidVersion,
@@ -610,6 +799,11 @@ export class BroadcasterRelay {
     } catch (error) {
       stored.usedAt = undefined;
       const failure = this.submitFailure(error, stored.id);
+      log.warn(
+        `submit ${stored.id.slice(0, 8)} failed as ${failure.code} after ${
+          Math.round((Date.now() - stored.issuedAt) / 1000)
+        }s`,
+      );
       job.status = "failed";
       job.httpStatus = failure.status;
       job.code = failure.code;
@@ -639,18 +833,69 @@ export class BroadcasterRelay {
   }
 
   private async waitForBroadcaster(
-    chain: ReturnType<typeof chainFor>,
+    chain: Chain,
     tokenAddress: string,
     timeoutMs: number,
-  ): Promise<ReturnType<BroadcasterNetwork["bestForToken"]>> {
-    const deadline = Date.now() + timeoutMs;
+  ): Promise<BroadcasterLookup> {
+    const startedAt = Date.now();
+    let reconnected = false;
     for (;;) {
       const broadcaster = this.deps.broadcasters.bestForToken(
         chain,
         tokenAddress,
       );
-      if (broadcaster || Date.now() >= deadline) return broadcaster;
-      await new Promise((resolve) => setTimeout(resolve, BROADCASTER_POLL_MS));
+      if (broadcaster) return broadcaster;
+      const waited = Date.now() - startedAt;
+      if (waited >= timeoutMs) return undefined;
+      if (!reconnected && waited >= 3_000) {
+        reconnected = true;
+        void this.deps.broadcasters.reconnect?.(chain);
+      }
+      await sleep(BROADCASTER_POLL_MS);
+    }
+  }
+
+  /**
+   * Waits for the broadcaster named by the quote instead of accepting whichever
+   * broadcaster happens to be cheapest now. A proof pays a fixed fee to a fixed
+   * address, so only that broadcaster can relay it.
+   */
+  private async waitForQuotedBroadcaster(
+    chain: Chain,
+    stored: StoredQuote,
+    timeoutMs: number,
+  ): Promise<BroadcasterLookup> {
+    const find = this.deps.broadcasters.broadcasterFor
+      ? () =>
+          this.deps.broadcasters.broadcasterFor?.(
+            chain,
+            stored.tokenAddress,
+            stored.feeRecipient,
+          )
+      : () =>
+          this.deps.broadcasters.bestForToken(chain, stored.tokenAddress);
+    const startedAt = Date.now();
+    let otherSince: number | undefined;
+    let reconnected = false;
+    for (;;) {
+      const quoted = find();
+      if (quoted) return quoted;
+      const now = Date.now();
+      if (!otherSince && this.deps.broadcasters.bestForToken(chain, stored.tokenAddress)) {
+        otherSince = now;
+      }
+      const waited = now - startedAt;
+      const replaced =
+        otherSince !== undefined &&
+        now - otherSince >= replacedAfter(this.deps);
+      if (replaced || waited >= timeoutMs) {
+        return this.deps.broadcasters.bestForToken(chain, stored.tokenAddress);
+      }
+      if (!reconnected && waited >= RECONNECT_AFTER_MS) {
+        reconnected = true;
+        void this.deps.broadcasters.reconnect?.(chain);
+      }
+      await sleep(BROADCASTER_POLL_MS);
     }
   }
 
