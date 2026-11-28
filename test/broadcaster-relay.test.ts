@@ -491,6 +491,44 @@ test("reports a stale quote only when the quoted broadcaster is replaced", async
   });
 });
 
+test("surfaces the broadcaster's rejection reason", async () => {
+  const relay = new BroadcasterRelay({
+    broadcasters: {
+      ensureChain: async () => undefined,
+      bestForToken: () => fakeBroadcaster("fees-1"),
+      broadcasterFor: () => fakeBroadcaster("fees-1"),
+      submit: async () => {
+        throw new Error("Received response error from broadcaster.", {
+          cause: new Error("Fees expired"),
+        });
+      },
+      stop: async () => undefined,
+    } as never,
+    provider: (() => fakeProvider) as never,
+  });
+  const quoted = await relay.quote({
+    network: "Ethereum" as never,
+    txidVersion: "V2_PoseidonMerkle" as never,
+    tokenHash,
+    amount: 10n ** 18n,
+    unshield: false,
+  });
+  await relay.startTransact({
+    network: "Ethereum" as never,
+    txidVersion: "V2_PoseidonMerkle" as never,
+    calldata: "0x1234",
+    quoteId: quoted.id,
+    nullifiers: [`0x${"11".repeat(32)}`],
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(await relay.transactStatus(quoted.id), {
+    id: quoted.id,
+    status: "failed",
+    code: "BROADCASTER_FAILED",
+    message: "The broadcaster rejected the transaction: Fees expired.",
+  });
+});
+
 test("broadcaster routes are disabled unless configured", async () => {
   await withServer({ enabled: true }, async (base) => {
     const response = await fetch(`${base}/api/light/v1/broadcaster/quote`, {

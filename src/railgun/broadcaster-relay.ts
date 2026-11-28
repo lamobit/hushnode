@@ -169,6 +169,22 @@ const strip0x = (value: string): string => value.replace(/^0x/, "");
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * Broadcasters answer a rejected transaction with a short reason ("Fees
+ * expired", "Invalid POI", ...). Keeping it in the failure message is the only
+ * way to tell a stale quote apart from a malformed submission after the fact.
+ */
+const rejectionReason = (error: unknown): string => {
+  const cause =
+    error instanceof Error && error.cause instanceof Error
+      ? error.cause.message
+      : error instanceof Error
+        ? error.message
+        : "";
+  const reason = cause.replace(/\s+/g, " ").trim().slice(0, 160);
+  return reason ? `: ${reason}` : "";
+};
+
 export const parseTokenHash = (value: unknown): string => {
   const hash =
     typeof value === "string" ? strip0x(value.trim()).toLowerCase() : "";
@@ -715,7 +731,7 @@ export class BroadcasterRelay {
         job.status = "failed";
         job.httpStatus = 502;
         job.code = "BROADCASTER_FAILED";
-        job.message = "The broadcaster rejected the transaction.";
+        job.message = `The broadcaster rejected the transaction${rejectionReason(error)}.`;
       });
     }
     return this.statusOf(stored);
@@ -828,7 +844,7 @@ export class BroadcasterRelay {
     return new BroadcasterRelayError(
       502,
       "BROADCASTER_FAILED",
-      "The broadcaster rejected the transaction.",
+      `The broadcaster rejected the transaction${rejectionReason(error)}.`,
     );
   }
 
