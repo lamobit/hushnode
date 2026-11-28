@@ -703,3 +703,152 @@ test("rejects malformed pre-transaction POIs on the transact route", async () =>
     },
   );
 });
+
+/**
+ * Proving happens on a phone and takes minutes, so the broadcaster's live fee
+ * has usually moved by the time a finished proof is submitted. The proof pays
+ * the fee it committed to, so small drift must not discard the proof.
+ */
+const driftRelay = (input: {
+  liveFeePerUnitGas: () => bigint;
+  submit: () => Promise<string>;
+  call?: () => Promise<string>;
+}) =>
+  new BroadcasterRelay({
+    broadcasters: {
+      ensureChain: async () => undefined,
+      bestForToken: () => ({
+        railgunAddress: `0zk1${"q".repeat(100)}`,
+        tokenAddress: `0x${"11".repeat(20)}`,
+        tokenFee: {
+          feesID: "fees-live",
+          feePerUnitGas: input.liveFeePerUnitGas().toString(),
+        },
+      }),
+      broadcasterFor: () => ({
+        railgunAddress: `0zk1${"q".repeat(100)}`,
+        tokenAddress: `0x${"11".repeat(20)}`,
+        tokenFee: {
+          feesID: "fees-live",
+          feePerUnitGas: input.liveFeePerUnitGas().toString(),
+        },
+      }),
+      submit: input.submit,
+      stop: async () => undefined,
+    } as never,
+    provider: (() => ({
+      feeData: async () => ({
+        baseFeePerGas: 10_000_000_000n,
+        maxFeePerGas: 20_000_000_000n,
+        maxPriorityFeePerGas: 1_000_000_000n,
+      }),
+      call: input.call ?? (async () => "0x"),
+    })) as never,
+  });
+
+const quoteOnDriftRelay = (relay: BroadcasterRelay) =>
+  relay.quote({
+    network: "Ethereum" as never,
+    txidVersion: "V2_PoseidonMerkle" as never,
+    tokenHash,
+    amount: 10n ** 18n,
+    unshield: false,
+  });
+
+const transactOnDriftRelay = (relay: BroadcasterRelay, id: string) =>
+  relay.startTransact({
+    network: "Ethereum" as never,
+    txidVersion: "V2_PoseidonMerkle" as never,
+    calldata: "0x1234",
+    quoteId: id,
+    nullifiers: [`0x${"11".repeat(32)}`],
+  });
+
+test("relays a proof whose quoted fee drifted up within tolerance", async () => {
+  let feePerUnitGas = 10n ** 18n;
+  const relay = driftRelay({
+    liveFeePerUnitGas: () => feePerUnitGas,
+    submit: async () => hash,
+  });
+  const quoted = await quoteOnDriftRelay(relay);
+  // One percent higher than the quote, still far inside the allowed drift.
+  feePerUnitGas = (10n ** 18n * 101n) / 100n;
+  await transactOnDriftRelay(relay, quoted.id);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(await relay.transactStatus(quoted.id), {
+    id: quoted.id,
+    status: "submitted",
+    hash,
+  });
+});
+
+test("rejects a proof only when the quoted fee really jumped", async () => {
+  let feePerUnitGas = 10n ** 18n;
+  const relay = driftRelay({
+    liveFeePerUnitGas: () => feePerUnitGas,
+    submit: async () => hash,
+  });
+  const quoted = await quoteOnDriftRelay(relay);
+  feePerUnitGas = (10n ** 18n * 105n) / 100n;
+  await transactOnDriftRelay(relay, quoted.id);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(await relay.transactStatus(quoted.id), {
+    id: quoted.id,
+    status: "failed",
+    code: "QUOTE_STALE",
+    message: "The broadcaster raised its fee; request a new quote.",
+  });
+});
+
+test("names the on-chain revert instead of blaming the broadcaster", async () => {
+  const relay = driftRelay({
+    liveFeePerUnitGas: () => 10n ** 18n,
+    submit: async () => {
+      throw new Error("Received response error from broadcaster.", {
+        cause: new Error(
+          "Tranaction is unable to be processed, RPC is saying Execution Reverted.",
+        ),
+      });
+    },
+    call: async () => {
+      throw Object.assign(
+        new Error(
+          "execution reverted: Nullifier already used (action=\"call\")",
+        ),
+        { code: "CALL_EXCEPTION", reason: "Nullifier already used" },
+      );
+    },
+  });
+  const quoted = await quoteOnDriftRelay(relay);
+  await transactOnDriftRelay(relay, quoted.id);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const status = await relay.transactStatus(quoted.id);
+  assert.equal(status.status, "failed");
+  assert.equal(
+    status.status === "failed" ? status.code : undefined,
+    "TRANSACT_REVERTED",
+  );
+  assert.match(
+    status.status === "failed" ? status.message : "",
+    /Nullifier already used/,
+  );
+});
+
+test("keeps the broadcaster failure when the calldata replays cleanly", async () => {
+  const relay = driftRelay({
+    liveFeePerUnitGas: () => 10n ** 18n,
+    submit: async () => {
+      throw new Error("Request timed out.", { cause: new Error("timed out") });
+    },
+    call: async () => "0x",
+  });
+  const quoted = await quoteOnDriftRelay(relay);
+  await transactOnDriftRelay(relay, quoted.id);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const status = await relay.transactStatus(quoted.id);
+  assert.equal(status.status, "failed");
+  assert.equal(
+    status.status === "failed" ? status.code : undefined,
+    "BROADCASTER_FAILED",
+  );
+});

@@ -44,6 +44,14 @@ const MAX_POI_STRING_LENGTH = 256;
 const MAX_POI_TOTAL_BYTES = 512 * 1024;
 const GAS_LIMIT_TRANSFER = 600_000n;
 const GAS_LIMIT_UNSHIELD = 800_000n;
+/**
+ * A phone spends a minute or more proving, and the broadcaster reprices its
+ * fee whenever gas moves. The proof can only pay the fee it committed to, so a
+ * live fee that drifted up by a fraction of a percent must not throw away a
+ * finished proof; only a real jump means the quote is stale.
+ */
+const FEE_DRIFT_BPS = 200n;
+const BPS_DENOMINATOR = 10_000n;
 const ONE_GWEI = 1_000_000_000n;
 const TOKEN_HASH = /^[0-9a-f]{64}$/;
 const CALLDATA = /^0x[0-9a-f]+$/i;
@@ -183,6 +191,57 @@ const rejectionReason = (error: unknown): string => {
         : "";
   const reason = cause.replace(/\s+/g, " ").trim().slice(0, 160);
   return reason ? `: ${reason}` : "";
+};
+
+const REVERT_SIGNAL = /execution reverted|CALL_EXCEPTION|reverted with reason/i;
+const REVERT_REASON =
+  /reverted with reason string '([^']+)'|execution reverted[:\s]+(.+)/i;
+
+const tidy = (value: string): string =>
+  value.replace(/\s+/g, " ").trim().replace(/^[:\s]+/, "").slice(0, 160);
+
+/**
+ * Pulls a human readable revert reason out of an RPC error. Providers nest the
+ * same failure under `message`, `shortMessage`, `info.error` or `data`, so walk
+ * the usual spots instead of trusting a single field.
+ */
+const revertDetail = (error: unknown): string | undefined => {
+  const seen = new Set<unknown>();
+  const texts: string[] = [];
+  const visit = (value: unknown, depth: number): void => {
+    if (depth > 4 || seen.has(value)) return;
+    if (typeof value === "string") {
+      texts.push(value);
+      return;
+    }
+    if (typeof value !== "object" || value === null) return;
+    seen.add(value);
+    for (const key of [
+      "message",
+      "shortMessage",
+      "reason",
+      "code",
+      "error",
+      "info",
+      "data",
+      "body",
+    ]) {
+      visit((value as Record<string, unknown>)[key], depth + 1);
+    }
+  };
+  visit(error, 0);
+  if (!texts.some((text) => REVERT_SIGNAL.test(text))) return undefined;
+  const reason =
+    typeof (error as { reason?: unknown }).reason === "string"
+      ? (error as { reason: string }).reason
+      : "";
+  if (tidy(reason)) return tidy(reason);
+  for (const text of texts) {
+    const match = REVERT_REASON.exec(text);
+    const detail = tidy(match?.[1] ?? match?.[2] ?? "");
+    if (detail) return detail;
+  }
+  return "execution reverted";
 };
 
 export const parseTokenHash = (value: unknown): string => {
@@ -776,11 +835,22 @@ export class BroadcasterRelay {
           },
           stored.gasDetails,
         );
-        if (required.amount > stored.fee) {
+        const beyondTolerance =
+          required.amount * BPS_DENOMINATOR >
+          stored.fee * (BPS_DENOMINATOR + FEE_DRIFT_BPS);
+        if (beyondTolerance) {
           throw new BroadcasterRelayError(
             409,
             "QUOTE_STALE",
             "The broadcaster raised its fee; request a new quote.",
+          );
+        }
+        if (required.amount > stored.fee) {
+          log.info(
+            `quote ${stored.id.slice(0, 8)} drifted ${(
+              ((required.amount - stored.fee) * BPS_DENOMINATOR) /
+              stored.fee
+            ).toString()}bps within tolerance`,
           );
         }
       }
@@ -815,15 +885,48 @@ export class BroadcasterRelay {
     } catch (error) {
       stored.usedAt = undefined;
       const failure = this.submitFailure(error, stored.id);
+      const diagnosis =
+        failure.code === "BROADCASTER_FAILED"
+          ? await this.simulate(stored, input.calldata)
+          : undefined;
       log.warn(
-        `submit ${stored.id.slice(0, 8)} failed as ${failure.code} after ${
+        `submit ${stored.id.slice(0, 8)} failed as ${
+          diagnosis ? "TRANSACT_REVERTED" : failure.code
+        } after ${
           Math.round((Date.now() - stored.issuedAt) / 1000)
         }s`,
       );
       job.status = "failed";
       job.httpStatus = failure.status;
-      job.code = failure.code;
-      job.message = failure.message;
+      job.code = diagnosis ? "TRANSACT_REVERTED" : failure.code;
+      job.message = diagnosis
+        ? `The transaction reverts on-chain: ${diagnosis}`
+        : failure.message;
+    }
+  }
+
+  /**
+   * A broadcaster whose gas estimate fails only says "execution reverted",
+   * which hides whether the proof, the merkle root, or an already spent
+   * nullifier is at fault. Replaying the same calldata against our own RPC
+   * names the reason instead of blaming the quote.
+   */
+  private async simulate(
+    stored: StoredQuote,
+    calldata: string,
+  ): Promise<string | undefined> {
+    try {
+      await this.deps.provider(stored.network).call({
+        to: NETWORK_CONFIG[stored.network].proxyContract,
+        data: calldata,
+      });
+      return undefined;
+    } catch (error) {
+      const reason = revertDetail(error);
+      if (!reason) {
+        log.warn(`could not replay ${stored.id.slice(0, 8)}`, error);
+      }
+      return reason;
     }
   }
 
