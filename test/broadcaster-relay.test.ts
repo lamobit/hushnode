@@ -171,6 +171,58 @@ test("validates pre-transaction POI payloads", () => {
   );
 });
 
+test("quotes enough fee for the broadcaster's own gas re-estimate", async () => {
+  const price = 20_000_000_000n;
+  /*
+   * A broadcaster re-estimates the calldata itself, adds 20% on L1 / 30% on
+   * L2, and accepts a packaged fee down to 90% / 70% of that. Quoting with a
+   * gas basis below the real transaction is what produced
+   * "Network Gas Price has changed dramatically".
+   */
+  const cases = [
+    { network: "Ethereum", gasRatio: 12n, acceptedBps: 9_000n },
+    { network: "Arbitrum", gasRatio: 13n, acceptedBps: 7_000n },
+  ] as const;
+  for (const { network, gasRatio, acceptedBps } of cases) {
+    const relay = new BroadcasterRelay({
+      broadcasters: {
+        ensureChain: async () => undefined,
+        bestForToken: () => ({
+          railgunAddress: `0zk1${"q".repeat(100)}`,
+          tokenAddress: `0x${"11".repeat(20)}`,
+          tokenFee: { feesID: "fees-1", feePerUnitGas: 10n ** 18n },
+        }),
+        stop: async () => undefined,
+      } as never,
+      provider: (() => ({
+        feeData: async () => ({
+          baseFeePerGas: price,
+          maxFeePerGas: price,
+          maxPriorityFeePerGas: 1_000_000_000n,
+        }),
+      })) as never,
+    });
+    for (const [unshield, estimate] of [
+      [false, 1_200_000n],
+      [true, 1_400_000n],
+    ] as const) {
+      const quoted = await relay.quote({
+        network: network as never,
+        txidVersion: "V2_PoseidonMerkle" as never,
+        tokenHash,
+        amount: 10n ** 18n,
+        unshield,
+      });
+      const broadcasterGas = (estimate * gasRatio) / 10n;
+      const floor = (broadcasterGas * price * acceptedBps) / 10_000n;
+      assert.ok(
+        quoted.fee >= floor,
+        `${network} ${unshield ? "unshield" : "transfer"} fee ${quoted.fee} < broadcaster floor ${floor}`,
+      );
+    }
+  }
+});
+
 test("rejects unknown quotes before touching the relay", async () => {
   const relay = new BroadcasterRelay({
     broadcasters: {

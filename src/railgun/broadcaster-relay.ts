@@ -42,8 +42,17 @@ const MAX_POI_MERKLE_ROOTS = 8;
 const MAX_POI_BLINDED_COMMITMENTS = 32;
 const MAX_POI_STRING_LENGTH = 256;
 const MAX_POI_TOTAL_BYTES = 512 * 1024;
-const GAS_LIMIT_TRANSFER = 600_000n;
-const GAS_LIMIT_UNSHIELD = 800_000n;
+/*
+ * The broadcaster re-estimates the calldata with eth_estimateGas and rejects
+ * the proof unless the packaged fee covers its own L1/L2 buffer minus a
+ * variance allowance (90% on Ethereum, 70% on Arbitrum). A two-input,
+ * three-commitment Railgun transaction actually uses ~1.1-1.3M gas on both
+ * chains, so quoting 600k made every proof look underpaid and the broadcaster
+ * reported it as "Network Gas Price has changed dramatically". Keep enough
+ * headroom above the observed estimates.
+ */
+const GAS_LIMIT_TRANSFER = 1_200_000n;
+const GAS_LIMIT_UNSHIELD = 1_500_000n;
 /**
  * A phone spends a minute or more proving, and the broadcaster reprices its
  * fee whenever gas moves. The proof can only pay the fee it committed to, so a
